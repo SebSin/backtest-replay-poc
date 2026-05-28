@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Static Replay</title>
+<script src="https://unpkg.com/lightweight-charts@5.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; }
+body { display: flex; flex-direction: column; font-family: -apple-system, BlinkMacSystemFont, 'Trebuchet MS', Roboto, Ubuntu, sans-serif; background: #131722; color: #d1d4dc; overflow: hidden; }
+#container { flex: 1; position: relative; }
+.controls { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 6px 12px; background: #1e222d; border-bottom: 1px solid #2a2e39; }
+.controls button {
+    padding: 6px 14px; font-size: 13px; font-weight: 600; border: none; border-radius: 6px;
+    cursor: pointer; background: #2a2e39; color: #d1d4dc;
+}
+.controls button:hover { background: #363a45; }
+.controls button.active { background: #2962FF; color: #fff; }
+.controls button:disabled { opacity: 0.3; cursor: not-allowed; }
+.controls label { font-size: 11px; color: #758696; text-transform: uppercase; letter-spacing: 0.5px; }
+.controls input[type=range] { width: 120px; accent-color: #2962FF; }
+.controls .info { font-size: 12px; color: #758696; margin-left: auto; white-space: nowrap; }
+#status { font-size: 11px; color: #758696; text-align: center; padding: 3px; background: #1e222d; }
+@media (max-width: 600px) {
+    .controls { gap: 4px; padding: 4px 6px; }
+    .controls button { padding: 5px 10px; font-size: 11px; min-height: 32px; }
+    .controls select { font-size: 11px; max-width: 100px; }
+    .controls label { font-size: 9px; }
+    .controls input[type=range] { width: 80px; }
+    .controls .info { font-size: 10px; }
+    #status { font-size: 9px; }
+    #container { min-height: 200px; }
+}
+@media (max-width: 400px) {
+    .controls { gap: 3px; padding: 3px 4px; }
+    .controls button { padding: 4px 8px; font-size: 10px; min-height: 30px; }
+    #speedSlider { width: 50px; }
+    .controls .info { font-size: 9px; }
+}
+</style>
+</head>
+<body>
+<div class="controls">
+    <label>Symbol</label>
+    <select id="symbolSelect" disabled>
+        <option value="USATECHIDXUSD">USATECHIDXUSD</option>
+    </select>
+    <button id="playBtn">▶ Play</button>
+    <button id="resetBtn">↻ Reset</button>
+    <label>Speed <span id="speedLabel">20</span></label>
+    <input type="range" id="speedSlider" min="1" max="100" value="20">
+    <span class="info" id="barInfo">Loading data...</span>
+</div>
+<div id="container"></div>
+<div id="status">Load static_replay_data.json alongside this file</div>
+<script>
+(function() {
+    let state = 'idle';
+    let bars = [];
+    let trades = [];
+    let equity = [];
+    let currentIdx = 0;
+    let startIdx = 0;  // first bar on or after Jan 1 2026
+    let stepPos = 0;
+    let steps = [];
+    let processInterval = null;
+    let speed = 20;
+    let markers = [];
+    const SPEED_MULT = 16;
+    const JAN_1_2026 = 1767225600;
+
+    const chart = LightweightCharts.createChart(document.getElementById('container'), {
+        layout: { textColor: '#d1d4dc', background: { type: 'solid', color: '#131722' } },
+        crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+        grid: { vertLines: { color: '#2a2e39' }, horzLines: { color: '#2a2e39' } },
+        timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#2a2e39' },
+        rightPriceScale: { borderColor: '#2a2e39' },
+        autoSize: true,
+    });
+
+    const candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
+        upColor: '#089981', downColor: '#f23645',
+        borderUpColor: '#089981', borderDownColor: '#f23645',
+        wickUpColor: '#089981', wickDownColor: '#f23645',
+    });
+
+    const equityPane = chart.addPane();
+    equityPane.setHeight(200);
+    const equitySeries = equityPane.addSeries(LightweightCharts.LineSeries, {
+        color: '#2962FF', lineWidth: 2,
+        priceFormat: { type: 'custom', minMove: 0.01, formatter: p => '$' + p.toFixed(0) },
+    });
+
+    // Legend
+    const legend = document.createElement('div');
+    legend.style.cssText = 'position:absolute;left:12px;top:12px;z-index:5;font-size:13px;font-family:sans-serif;line-height:20px;color:#d1d4dc;background:#1e222d;padding:6px 12px;border-radius:6px;pointer-events:none;';
+    document.getElementById('container').appendChild(legend);
+    legend.textContent = 'Loading...';
+    function updateLegend(idx) {
+        if (idx < 0 || idx >= bars.length || idx >= equity.length) return;
+        legend.innerHTML = `<b>USATECHIDXUSD</b>   Equity: <b>$${equity[idx].toFixed(0)}</b>   Bar: ${idx}/${bars.length}`;
+    }
+
+    // Markers plugin (create once, use setMarkers to update)
+    let markersPlugin = null;
+    if (typeof LightweightCharts.createSeriesMarkers === 'function') {
+        markersPlugin = LightweightCharts.createSeriesMarkers(candleSeries, []);
+    }
+    function updateTradeMarkers(markers) {
+        if (markersPlugin) markersPlugin.setMarkers(markers);
+    }
+
+    // Trade lookup maps for O(1) access
+    let entryMap = {};
+    let exitMap = {};
+
+    // Load data
+    function loadData() {
+        document.getElementById('barInfo').textContent = 'Loading...';
+        fetch('static_replay_data.json')
+            .then(r => { if (!r.ok) throw new Error(r.statusText); return r.json(); })
+            .then(data => {
+                bars = (data.bars || []).map(b => ({
+                    time: b.t, open: b.o, high: b.h, low: b.l, close: b.c,
+                }));
+                trades = (data.trades || []).map(t => ({
+                    entry_time: t.entry_time, exit_time: t.exit_time,
+                    entry_price: t.entry_price, exit_price: t.exit_price,
+                    dir: t.dir, pnl: t.pnl, confidence: t.confidence,
+                }));
+                equity = data.equity || [];
+                entryMap = {};
+                exitMap = {};
+                trades.forEach(t => {
+                    entryMap[t.entry_time] = t;
+                    exitMap[t.exit_time] = t;
+                });
+                // Find first bar on or after Jan 1 2026
+                const jan1 = JAN_1_2026;
+                startIdx = bars.findIndex(b => b.time >= jan1);
+                if (startIdx < 0) startIdx = bars.length;
+                document.getElementById('barInfo').textContent = `${bars.length} bars loaded`;
+                document.getElementById('status').textContent =
+                    `${data.meta.symbol} ${data.meta.frequency}  |  ${trades.length} trades`;
+                document.getElementById('playBtn').disabled = false;
+                if (bars.length > 0) renderSeed();
+                updateLegend(Math.max(0, startIdx - 1));
+            })
+            .catch(err => {
+                document.getElementById('barInfo').textContent = 'Load error';
+                document.getElementById('status').textContent = err.message;
+                document.getElementById('playBtn').disabled = false;
+            });
+    }
+
+    function renderSeed() {
+        // Show 200 bars before the start point as context
+        const ctxStart = Math.max(0, startIdx - 200);
+        const seed = bars.slice(ctxStart, startIdx);
+        candleSeries.setData(seed);
+        // Seed equity with matching range
+        const eqSeed = [];
+        for (let i = ctxStart; i < startIdx && i < equity.length; i++) {
+            eqSeed.push({ time: bars[i].time, value: equity[i] });
+        }
+        if (eqSeed.length > 0) equitySeries.setData(eqSeed);
+        chart.timeScale().fitContent();
+        currentIdx = 0;
+        stepPos = 0;
+        steps = [];
+    }
+
+    function getSteps(idx) {
+        const b = bars[idx];
+        const midH = (b.open + b.high) / 2, midL = (b.open + b.low) / 2;
+        return [
+            { o: b.open, h: b.open, l: b.open, c: b.open },
+            { o: b.open, h: midH, l: midL, c: (b.open + b.close) / 2 },
+            { o: b.open, h: b.high, l: b.low, c: b.close },
+        ];
+    }
+
+    function processTick() {
+        if (state !== 'playing') return;
+        if (currentIdx >= bars.length) return;
+        const bar = bars[currentIdx];
+
+        if (stepPos === 0) {
+            steps = getSteps(currentIdx);
+        }
+
+        if (stepPos < steps.length) {
+            const s = steps[stepPos];
+            candleSeries.update({ time: bar.time, open: s.o, high: s.h, low: s.l, close: s.c });
+            stepPos++;
+        }
+
+        if (stepPos >= steps.length) {
+            // Bar just completed — update equity, check trades
+            if (currentIdx < equity.length) {
+                equitySeries.update({ time: bar.time, value: equity[currentIdx] });
+            }
+            const barTime = bar.time;
+            let newMarker = false;
+            const entryTrade = entryMap[barTime];
+            if (entryTrade) {
+                markers.push({ time: barTime, position: entryTrade.dir === 'LONG' ? 'belowBar' : 'aboveBar',
+                    shape: entryTrade.dir === 'LONG' ? 'arrowUp' : 'arrowDown',
+                    color: entryTrade.dir === 'LONG' ? '#2962FF' : '#f68410',
+                    text: entryTrade.dir });
+                newMarker = true;
+            }
+            const exitTrade = exitMap[barTime];
+            if (exitTrade) {
+                markers.push({ time: barTime, position: 'aboveBar',
+                    shape: 'cross', color: exitTrade.dir === 'LONG' ? '#2962FF' : '#f68410',
+                    text: `$${exitTrade.pnl > 0 ? '+' : ''}${exitTrade.pnl}` });
+                newMarker = true;
+            }
+            if (newMarker) updateTradeMarkers(markers);
+            updateLegend(currentIdx);
+
+            currentIdx++;
+            stepPos = 0;
+            document.getElementById('barInfo').textContent = `${currentIdx} / ${bars.length}`;
+        }
+
+        if (currentIdx >= bars.length) {
+            state = 'idle';
+            document.getElementById('playBtn').textContent = '▶ Done';
+            document.getElementById('playBtn').disabled = true;
+            if (processInterval) { clearInterval(processInterval); processInterval = null; }
+            chart.timeScale().fitContent();
+        }
+    }
+
+    function startPlay() {
+        if (bars.length === 0) return;
+        state = 'playing';
+        document.getElementById('playBtn').textContent = '⏸ Pause';
+        currentIdx = Math.max(0, startIdx);
+        stepPos = 0;
+        steps = [];
+        markers = [];
+        updateTradeMarkers([]);
+        if (processInterval) clearInterval(processInterval);
+        processInterval = setInterval(processTick, 1000 / Math.max(speed * SPEED_MULT, 4));
+    }
+
+    document.getElementById('speedLabel').textContent = speed;
+    document.getElementById('speedSlider').addEventListener('input', (e) => {
+        speed = parseInt(e.target.value);
+        document.getElementById('speedLabel').textContent = speed;
+        if (processInterval) {
+            clearInterval(processInterval);
+        processInterval = setInterval(processTick, 1000 / Math.max(speed * SPEED_MULT, 4));
+        }
+    });
+
+    document.getElementById('playBtn').addEventListener('click', () => {
+        if (state === 'idle') startPlay();
+        else if (state === 'playing') {
+            state = 'paused';
+            document.getElementById('playBtn').textContent = '▶ Resume';
+        } else {
+            state = 'playing';
+            document.getElementById('playBtn').textContent = '⏸ Pause';
+        }
+    });
+
+    document.getElementById('resetBtn').addEventListener('click', () => {
+        state = 'idle';
+        if (processInterval) { clearInterval(processInterval); processInterval = null; }
+        candleSeries.setData([]);
+        equitySeries.setData([]);
+        markers = [];
+        updateTradeMarkers([]);
+        currentIdx = Math.max(0, startIdx);
+        stepPos = 0;
+        steps = [];
+        document.getElementById('playBtn').textContent = '▶ Play';
+        document.getElementById('playBtn').disabled = false;
+        document.getElementById('barInfo').textContent = `${bars.length} bars loaded`;
+        if (bars.length > 0) renderSeed();
+        updateLegend(Math.max(0, startIdx - 1));
+    });
+
+    loadData();
+})();
+</script>
+</body>
+</html>
