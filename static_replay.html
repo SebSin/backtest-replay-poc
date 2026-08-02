@@ -62,6 +62,7 @@ body { display: flex; flex-direction: column; font-family: -apple-system, BlinkM
     let bars = [];
     let trades = [];
     let equity = [];
+    let symbolName = 'USATECHIDXUSD';
     let currentIdx = 0;
     let startIdx = 0;  // first bar on or after Jan 1 2026
     let stepPos = 0;
@@ -101,7 +102,7 @@ body { display: flex; flex-direction: column; font-family: -apple-system, BlinkM
     legend.textContent = 'Loading...';
     function updateLegend(idx) {
         if (idx < 0 || idx >= bars.length || idx >= equity.length) return;
-        legend.innerHTML = `<b>USATECHIDXUSD</b>   Equity: <b>$${equity[idx].toFixed(0)}</b>   Bar: ${idx}/${bars.length}`;
+        legend.innerHTML = `<b>${symbolName}</b>   Equity: <b>$${equity[idx].toFixed(0)}</b>   Bar: ${idx}/${bars.length}`;
     }
 
     // Markers plugin (create once, use setMarkers to update)
@@ -132,6 +133,7 @@ body { display: flex; flex-direction: column; font-family: -apple-system, BlinkM
                     dir: t.dir, pnl: t.pnl, confidence: t.confidence,
                 }));
                 equity = data.equity || [];
+                symbolName = (data.meta && data.meta.symbol) || symbolName;
                 entryMap = {};
                 exitMap = {};
                 trades.forEach(t => {
@@ -143,8 +145,13 @@ body { display: flex; flex-direction: column; font-family: -apple-system, BlinkM
                 startIdx = bars.findIndex(b => b.time >= jan1);
                 if (startIdx < 0) startIdx = bars.length;
                 document.getElementById('barInfo').textContent = `${bars.length} bars loaded`;
+                const m = data.meta || {};
                 document.getElementById('status').textContent =
-                    `${data.meta.symbol} ${data.meta.frequency}  |  ${trades.length} trades`;
+                    `${m.symbol || 'USATECHIDXUSD'} ${m.frequency || '15m'}  |  ${trades.length} trades` +
+                    (m.sharpe != null ? `  |  Sharpe ${m.sharpe}` : '') +
+                    (m.win_rate != null ? `  |  WR ${m.win_rate}%` : '') +
+                    (m.final_equity != null ? `  |  Eq $${m.final_equity.toLocaleString()}` : '') +
+                    (m.config ? `  |  ${m.config}` : '');
                 document.getElementById('playBtn').disabled = false;
                 if (bars.length > 0) renderSeed();
                 updateLegend(Math.max(0, startIdx - 1));
